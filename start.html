@@ -7514,6 +7514,11 @@ function buildAK74(THREE, opts) {
       add('elbow' + S, 'shoulder' + S, [s * M.upperArm, 0, 0]);
       add('wrist' + S, 'elbow' + S, [s * M.foreArm, 0, 0]);
       add('palm' + S, 'wrist' + S, [s * 0.028, 0, 0]);
+      /* Листовые кости скручивания: armTwist гасит скрутку плеча у дельты,
+         foreTwist переносит пронацию кисти в предплечье. Веса им раздаёт
+         загрузчик модели (packGeometry). */
+      add('armTwist' + S, 'shoulder' + S, [s * M.upperArm * 0.35, 0, 0]);
+      add('foreTwist' + S, 'elbow' + S, [s * M.foreArm * 0.6, 0, 0]);
 
       /* пальцы: пясть -> 3 фаланги. Ось X — вдоль руки наружу. */
       for (const f of FINGERS) {
@@ -9645,12 +9650,105 @@ function buildAK74(THREE, opts) {
       root.add(mesh);
       meshes[g] = mesh;
     }
+    enableDQS(THREE, skeleton, Object.values(meshes));
 
     return {
       key, preset: P, root, skeleton, bones: tb, boneIndex: BI, metrics: M,
       rest, meshes, materials: mats,
       bone: (n) => tb[BI[n]]
     };
+  }
+
+  /* ------------------------------------ dual quaternion skinning --- */
+  /* Модель привязана к скелету в T-позе, и рука, опущенная к корпусу,
+     поворачивается в плече на 60–70°. Линейное смешивание матриц на таком
+     угле «сдувает» дельту и подмышку: плечо сужается, рукав проваливается
+     в корпус — рука выглядит прилипшей к туловищу. Смешивание двойных
+     кватернионов поворачивает вершину вокруг сустава и сохраняет объём.
+
+     Кватернионы лежат в той же текстуре костей, после матриц: её three.js
+     загружает при каждой отрисовке скиннированного меша. Матрицы остаются
+     на месте — тени и AO (служебные материалы) считаются по ним. */
+  function enableDQS(THREE, skeleton, meshes) {
+    const nb = skeleton.bones.length;
+    let size = 4;
+    while (size * size < nb * 6) size += 4;
+    const arr = new Float32Array(size * size * 4);
+    arr.set(skeleton.boneMatrices);
+    skeleton.boneMatrices = arr;
+    skeleton.boneTexture = new THREE.DataTexture(arr, size, size, THREE.RGBAFormat, THREE.FloatType);
+    skeleton.boneTexture.needsUpdate = true;
+    const base = nb * 16, m4 = new THREE.Matrix4(), q = new THREE.Quaternion();
+    const update = skeleton.update.bind(skeleton);
+    skeleton.update = function () {
+      update();
+      const bm = this.boneMatrices;
+      for (let i = 0; i < nb; i++) {
+        q.setFromRotationMatrix(m4.fromArray(bm, i * 16));
+        const tx = bm[i * 16 + 12], ty = bm[i * 16 + 13], tz = bm[i * 16 + 14], o = base + i * 8;
+        bm[o] = q.x; bm[o + 1] = q.y; bm[o + 2] = q.z; bm[o + 3] = q.w;
+        /* дуальная часть: 0,5 · t ⊗ q */
+        bm[o + 4] = 0.5 * (tx * q.w + ty * q.z - tz * q.y);
+        bm[o + 5] = 0.5 * (-tx * q.z + ty * q.w + tz * q.x);
+        bm[o + 6] = 0.5 * (tx * q.y - ty * q.x + tz * q.w);
+        bm[o + 7] = -0.5 * (tx * q.x + ty * q.y + tz * q.z);
+      }
+    };
+    const DQ0 = nb * 4;
+    const pars = `
+#ifdef USE_SKINNING
+vec4 dqFetch(const in float i, const in int k) {
+  int size = textureSize(boneTexture, 0).x;
+  int j = ${DQ0} + int(i) * 2 + k;
+  return texelFetch(boneTexture, ivec2(j % size, j / size), 0);
+}
+#endif`;
+    const blend = `
+#ifdef USE_SKINNING
+vec4 dqR0 = dqFetch(skinIndex.x, 0), dqD0 = dqFetch(skinIndex.x, 1);
+vec4 dqR1 = dqFetch(skinIndex.y, 0), dqD1 = dqFetch(skinIndex.y, 1);
+vec4 dqR2 = dqFetch(skinIndex.z, 0), dqD2 = dqFetch(skinIndex.z, 1);
+vec4 dqR3 = dqFetch(skinIndex.w, 0), dqD3 = dqFetch(skinIndex.w, 1);
+vec4 dqW = skinWeight * vec4(1.0, sign(dot(dqR0, dqR1) + 1e-6), sign(dot(dqR0, dqR2) + 1e-6), sign(dot(dqR0, dqR3) + 1e-6));
+vec4 dqR = dqW.x * dqR0 + dqW.y * dqR1 + dqW.z * dqR2 + dqW.w * dqR3;
+vec4 dqD = dqW.x * dqD0 + dqW.y * dqD1 + dqW.z * dqD2 + dqW.w * dqD3;
+float dqL = length(dqR);
+dqR /= dqL; dqD /= dqL;
+#endif`;
+    const nrm = `
+#ifdef USE_SKINNING
+vec3 dqN = (bindMatrix * vec4(objectNormal, 0.0)).xyz;
+dqN += 2.0 * cross(dqR.xyz, cross(dqR.xyz, dqN) + dqR.w * dqN);
+objectNormal = (bindMatrixInverse * vec4(dqN, 0.0)).xyz;
+#ifdef USE_TANGENT
+vec3 dqT = (bindMatrix * vec4(objectTangent, 0.0)).xyz;
+dqT += 2.0 * cross(dqR.xyz, cross(dqR.xyz, dqT) + dqR.w * dqT);
+objectTangent = (bindMatrixInverse * vec4(dqT, 0.0)).xyz;
+#endif
+#endif`;
+    const pos = `
+#ifdef USE_SKINNING
+vec3 dqP = (bindMatrix * vec4(transformed, 1.0)).xyz;
+dqP += 2.0 * cross(dqR.xyz, cross(dqR.xyz, dqP) + dqR.w * dqP);
+dqP += 2.0 * (dqR.w * dqD.xyz - dqD.w * dqR.xyz + cross(dqR.xyz, dqD.xyz));
+transformed = (bindMatrixInverse * vec4(dqP, 1.0)).xyz;
+#endif`;
+    for (const mesh of meshes) {
+      const mat = mesh.material;
+      if (!mat || mat.userData.dqs) continue;
+      mat.userData.dqs = true;
+      const prev = mat.onBeforeCompile, key0 = mat.customProgramCacheKey();
+      mat.onBeforeCompile = function (sh, r) {
+        if (prev) prev.call(this, sh, r);
+        sh.vertexShader = sh.vertexShader
+          .replace('#include <skinning_pars_vertex>', '#include <skinning_pars_vertex>' + pars)
+          .replace('#include <skinbase_vertex>', blend)
+          .replace('#include <skinnormal_vertex>', nrm)
+          .replace('#include <skinning_vertex>', pos);
+      };
+      mat.customProgramCacheKey = () => key0 + '|dqs' + DQ0;
+      mat.needsUpdate = true;
+    }
   }
 
   /* Геометрия бойца одна на всех: строится один раз на тип головного
@@ -9687,6 +9785,65 @@ function buildAK74(THREE, opts) {
   /* Буферы общие для всех бойцов; какие меши надеть, решает пресет:
      поле when меша — условия на поля пресета (head, mask). */
   const packGeoCache = new Map();
+  const sstep = (e0, e1, x) => { const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+
+  /* Веса костей скручивания. У модели плечо и предплечье — по одной
+     кости, и вся пронация кисти ложилась на узкую зону у запястья:
+     рукав перекручивался «фантиком». Часть веса предплечья плавно
+     переходит на foreTwist (0 у локтя -> 1 у запястья), часть веса плеча
+     у дельты — на armTwist, который гасит скрутку плеча. */
+  function splitTwist(si, sw, pos, n, BI, J) {
+    const sides = ['R', 'L'].map((S) => ({
+      sh: BI['shoulder' + S], el: BI['elbow' + S], at: BI['armTwist' + S], ft: BI['foreTwist' + S],
+      xS: Math.abs(J['shoulder' + S][0]), xE: Math.abs(J['elbow' + S][0]), xW: Math.abs(J['wrist' + S][0])
+    }));
+    if (sides.some((d) => d.at === undefined || d.ft === undefined)) return false;
+    const inf = new Map();
+    let any = false;
+    for (let v = 0; v < n; v++) {
+      const x = pos[v * 3], d = sides[x >= 0 ? 0 : 1], ax = Math.abs(x);
+      inf.clear();
+      for (let k = 0; k < 4; k++) {
+        const w = sw[v * 4 + k];
+        if (w > 0) inf.set(si[v * 4 + k], (inf.get(si[v * 4 + k]) || 0) + w);
+      }
+      const wS = inf.get(d.sh) || 0, wE = inf.get(d.el) || 0;
+      let touched = false;
+      if (wS > 0) {
+        const share = 1 - sstep(0, 0.9, (ax - d.xS) / (d.xE - d.xS));
+        if (share > 0) { inf.set(d.sh, wS * (1 - share)); inf.set(d.at, (inf.get(d.at) || 0) + wS * share); touched = true; }
+      }
+      if (wE > 0) {
+        const share = sstep(0.05, 0.95, (ax - d.xE) / (d.xW - d.xE));
+        if (share > 0) { inf.set(d.el, wE * (1 - share)); inf.set(d.ft, (inf.get(d.ft) || 0) + wE * share); touched = true; }
+      }
+      if (!touched) continue;
+      any = true;
+      const top = [...inf.entries()].filter((e) => e[1] > 1e-4).sort((a, b) => b[1] - a[1]).slice(0, 4);
+      const tot = top.reduce((a, e) => a + e[1], 0) || 1;
+      for (let k = 0; k < 4; k++) {
+        si[v * 4 + k] = top[k] ? top[k][0] : 0;
+        sw[v * 4 + k] = top[k] ? top[k][1] / tot : 0;
+      }
+    }
+    return any;
+  }
+
+  /* Рукава кителя объёмнее: у модели они сидели почти по руке (радиус
+     предплечья ~4 см), а куртка на референсе заметно шире. Раздувается
+     только рукав — от подмышки до манжеты; корпус под жилетом не трогаем,
+     у манжеты прибавка меньше, чтобы рукав оставался поверх перчатки. */
+  function puffSleeves(pos, nrm, n) {
+    for (let v = 0; v < n; v++) {
+      const ax = Math.abs(pos[v * 3]);
+      if (ax < 0.23) continue;
+      const d = sstep(0.23, 0.31, ax) * (0.013 - 0.0025 * sstep(0.40, 0.55, ax)) * (1 - 0.5 * sstep(0.66, 0.77, ax)) / 32767;
+      pos[v * 3] += nrm[v * 3] * d;
+      pos[v * 3 + 1] += nrm[v * 3 + 1] * d;
+      pos[v * 3 + 2] += nrm[v * 3 + 2] * d;
+    }
+  }
+
   function packGeometry(THREE, pack, P, BI) {
     const hdr = pack.hdr, bin = pack.bin;
     const remap = hdr.bones.map((n) => (BI[n] === undefined ? BI.hips : BI[n]));
@@ -9697,13 +9854,19 @@ function buildAK74(THREE, opts) {
       if (!geo) {
         const n = m.count;
         geo = new THREE.BufferGeometry();
-        geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(bin, m.pos[0], m.pos[1]), 3));
-        geo.setAttribute('normal', new THREE.BufferAttribute(new Int16Array(bin, m.nrm[0], m.nrm[1]), 3, true));
+        const pos = new Float32Array(bin, m.pos[0], m.pos[1]).slice();
+        const nrm = new Int16Array(bin, m.nrm[0], m.nrm[1]);
+        if ((m.group || m.name) === 'shirt') puffSleeves(pos, nrm, n);
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3, true));
         geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(bin, m.uv[0], m.uv[1]), 2));
         const si = new Uint8Array(bin, m.si[0], m.si[1]), si16 = new Uint16Array(n * 4);
         for (let i = 0; i < si.length; i++) si16[i] = remap[si[i]];
+        const sw8 = new Uint8Array(bin, m.sw[0], m.sw[1]), sw = new Float32Array(n * 4);
+        for (let i = 0; i < sw.length; i++) sw[i] = sw8[i] / 255;
+        splitTwist(si16, sw, pos, n, BI, hdr.joints);
         geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(si16, 4));
-        geo.setAttribute('skinWeight', new THREE.BufferAttribute(new Uint8Array(bin, m.sw[0], m.sw[1]), 4, true));
+        geo.setAttribute('skinWeight', new THREE.BufferAttribute(sw, 4));
         geo.setIndex(new THREE.BufferAttribute(m.index32 ? new Uint32Array(bin, m.index[0], m.index[1])
           : new Uint16Array(bin, m.index[0], m.index[1]), 1));
         geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 1, 0), 1.2);
@@ -10018,19 +10181,95 @@ function buildAK74(THREE, opts) {
       palmDir: [0.96, -0.24, -0.12],
       curl: [1.02, 1.08, 1.06, 0.98],
       thumb: 0.55
+    },
+    /* В ПРИЦЕЛЕ цевьё лежит в ладони: кисть под ним, большой палец вдоль
+       левого бока, пальцы поднимаются по правому. Верх цевья всего на 4 мм
+       ниже прицельной линии (0,112 против 0,116), поэтому ни один палец не
+       должен заходить наверх — иначе он закрывает мушку. Ось пальцев
+       смотрит вправо-вперёд, тыльная сторона кисти — вниз-влево.
+       Значения X даны для правой руки и зеркалятся по стороне. */
+    leftAds: {
+      node: 'gripL',
+      offset: [0.036, -0.031, 0.028],
+      fingerDir: [-0.70, 0.05, -0.70],
+      palmDir: [0.10, -0.99, 0.0],
+      curl: [0.85, 0.90, 0.90, 0.85],
+      thumb: 0.10,
+      /* большой палец вдоль левого бока, а не вверх: при обычном
+         противопоставлении он вставал над цевьём выше мушки */
+      thumbBase: [0.35, 0.02]
+    },
+    /* НА РЕМНЕ кисть подходит к цевью сверху-снаружи: тыльная сторона
+       смотрит от бойца, пальцы спускаются по правому боку оружия и
+       подхватывают цевьё снизу, большой палец лежит вдоль него. */
+    leftSling: {
+      node: 'gripL',
+      offset: [-0.030, 0.060, 0.020],
+      fingerDir: [-0.10, -0.90, -0.42],
+      palmDir: [-0.95, 0.10, 0.10],
+      curl: [1.15, 1.20, 1.20, 1.15],
+      thumb: 0.45
     }
   };
+
+  /* Смесь двух хватов: смещение и оси — линейно, сгибы пальцев — линейно. */
+  function mixGrip(a, b, k) {
+    if (k <= 0) return a;
+    if (k >= 1) return b;
+    const l = (x, y) => x.map((v, i) => v + (y[i] - v) * k);
+    return {
+      node: a.node, offset: l(a.offset, b.offset), fingerDir: l(a.fingerDir, b.fingerDir),
+      palmDir: l(a.palmDir, b.palmDir), curl: l(a.curl, b.curl), thumb: a.thumb + (b.thumb - a.thumb) * k,
+      thumbBase: l(a.thumbBase || [0.55, 0.30], b.thumbBase || [0.55, 0.30])
+    };
+  }
+
+  /* ================================================== позы рук ========== */
+  /* Куда смотрит локоть — направление от плечевого сустава в системе груди:
+     x — наружу (для своей стороны), y — вверх, z — назад. clav — доля
+     отклонения ключицы к цели кисти: [протракция, подъём]. reach — до какой
+     доли длины вытягивается опорная рука; дальше кисть скользит по цевью.
+
+     На ремне оба локтя разведены наружу и чуть назад: жилет шире плечевого
+     сустава модели (0,20–0,23 м против 0,224), и рука, опущенная отвесно,
+     уходит в него. Плечо отведено от корпуса на 20–25°, как на референсе. */
+  const ARM = {
+    sling: { R: [0.62, -0.72, 0.30], L: [0.75, -0.62, 0.25], clav: [0.20, 0.14], reach: 0.95 },
+    ready: { R: [0.22, -0.93, 0.30], L: [-0.11, -0.99, -0.06], clav: [0.30, 0.10], reach: 0.86 },
+    ads: { R: [0.30, -0.90, 0.30], L: [-0.06, -0.99, -0.10], clav: [0.30, 0.10], reach: 0.86 }
+  };
+  function mixArm(a, b, k) {
+    const l = (x, y) => x.map((v, i) => v + (y[i] - v) * k);
+    return { R: l(a.R, b.R), L: l(a.L, b.L), clav: l(a.clav, b.clav), reach: a.reach + (b.reach - a.reach) * k };
+  }
+
+  /* Кость в мировом базисе: ex — вдоль кости, ey — ось шарнира. */
+  function setWorldBasis(THREE, bone, ex, ey) {
+    const ez = new THREE.Vector3().crossVectors(ex, ey);
+    const wq = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(ex, ey, ez));
+    bone.quaternion.copy(bone.parent.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(wq));
+    bone.updateMatrixWorld(true);
+  }
+  /* Угол скрутки кватерниона вокруг локальной оси X (swing-twist). */
+  function twistX(q) {
+    let a = 2 * Math.atan2(q.x, q.w);
+    if (a > Math.PI) a -= 2 * Math.PI;
+    if (a < -Math.PI) a += 2 * Math.PI;
+    return a;
+  }
 
   /* Сгиб пальцев вокруг локальной оси Z кости: базовая «хватка».
      Значения — типичный обхват цилиндра диаметром ~35 мм. */
   function curlFingers(rig, side, amount, trigger) {
     const SS = side > 0 ? 'R' : 'L';
+    /* amount — число или сгиб по пальцам [указательный, средний, безымянный, мизинец] */
     const A = amount;
     const PH = [0.95, 1.15, 0.85];        // относительный сгиб фаланг
     for (let fi = 0; fi < SK.FINGERS.length; fi++) {
       const f = SK.FINGERS[fi];
+      const Af = Array.isArray(A) ? A[fi] : A;
       /* указательный правой руки управляется отдельно — он на спуске */
-      const k = (side > 0 && f.key === 'index' && trigger !== undefined) ? trigger : A;
+      const k = (side > 0 && f.key === 'index' && trigger !== undefined) ? trigger : Af;
       for (let ph = 0; ph < 3; ph++) {
         const b = rig.bone(f.key + SS + (ph + 1));
         b.rotation.set(0, 0, 0);
@@ -10041,11 +10280,13 @@ function buildAK74(THREE, opts) {
       }
     }
     /* большой палец: противопоставлен, гнётся меньше и заваливается вбок */
-    const th = rig.thumbAmount === undefined ? A : rig.thumbAmount;
+    const th = rig.thumbAmount === undefined ? (Array.isArray(A) ? A[0] : A) : rig.thumbAmount;
+    /* основание: [отведение от указательного, противопоставление к ладони] */
+    const tb = rig.thumbBase || [0.55, 0.30];
     for (let ph = 0; ph < 3; ph++) {
       const b = rig.bone('thumb' + SS + (ph + 1));
       b.rotation.set(0, 0, 0);
-      if (ph === 0) { b.rotation.y = side * 0.55; b.rotation.z = -side * (0.30 + th * 0.35); }
+      if (ph === 0) { b.rotation.y = side * tb[0]; b.rotation.z = -side * (tb[1] + th * 0.35); }
       else b.rotation.z = -side * th * 0.85;
     }
   }
@@ -10106,134 +10347,118 @@ function buildAK74(THREE, opts) {
     const THREE = this.THREE;
     const W = weapon;                       // Object3D оружия (система АК)
     W.updateMatrixWorld(true);
+    const kr = this.readyAmount === undefined ? 1 : U.clamp01(this.readyAmount);
+    const ka = U.clamp01(this.adsAmount || 0);
+    const pose = mixArm(mixArm(ARM.sling, ARM.ready, kr), ARM.ads, ka);
+    const wq = W.getWorldQuaternion(new THREE.Quaternion());
+    const chestQ = this.bone('chest').getWorldQuaternion(new THREE.Quaternion());
+    const chestQi = chestQ.clone().invert();
+    const rest = this.char.rest;
+    this.gripTarget = this.gripTarget || {};
+    this.armDebug = this.armDebug || {};
 
     for (const side of [1, -1]) {
       const SS = side > 0 ? 'R' : 'L';
-      const G = side > 0 ? GRIP.right : GRIP.left;
+      const G = side > 0 ? GRIP.right : mixGrip(mixGrip(GRIP.leftSling, GRIP.left, kr), GRIP.leftAds, ka);
       const node = W.getObjectByName(G.node) || W;
-      const wp = node.getWorldPosition(new THREE.Vector3());
-
       /* смещение хвата задано в системе оружия */
-      const off = new THREE.Vector3(G.offset[0] * side, G.offset[1], G.offset[2])
-        .applyQuaternion(W.getWorldQuaternion(new THREE.Quaternion()));
-      const target = wp.clone().add(off);
+      const target = node.getWorldPosition(new THREE.Vector3())
+        .add(new THREE.Vector3(G.offset[0] * side, G.offset[1], G.offset[2]).applyQuaternion(wq));
 
-      /* Подгонка хвата под длину руки.
+      const clav = this.bone('clav' + SS), shoulder = this.bone('shoulder' + SS);
+      const elbow = this.bone('elbow' + SS), wrist = this.bone('wrist' + SS);
+      const dist3 = (a, b) => Math.hypot(rest[a][0] - rest[b][0], rest[a][1] - rest[b][1], rest[a][2] - rest[b][2]);
+      const lenA = dist3('shoulder' + SS, 'elbow' + SS), lenB = dist3('elbow' + SS, 'wrist' + SS);
 
-         Точка на цевье — не гвоздь: стрелок сам выбирает, где держать, и
-         если до идеальной точки не дотянуться, кисть скользит назад.
-
-         ОГРАНИЧЕНИЕ ХОДА. Раньше кисть могла уехать на 0,22 м — это уже не
-         цевьё, а ствольная коробка: рука оказывалась прямо перед глазом и
-         в прицеле закрывала мушку (скрин 5). Реальное цевьё АК даёт около
-         0,09 м хода, дальше кисть упирается в магазин. Поэтому ход урезан,
-         а дефицит вылета добирает корпус (разворот плеч) — как у человека.
-
-         Комфортный вылет поднят с 0,80 до 0,86 длины руки: при 0,80 локоть
-         складывался сильнее, чем нужно, и кисть заезжала назад без причины. */
-      if (side < 0) {
-        const shoulder = this.bone('shoulder' + SS).getWorldPosition(new THREE.Vector3());
-        const elbowP = this.bone('elbow' + SS).getWorldPosition(new THREE.Vector3());
-        const armLen = shoulder.distanceTo(elbowP)
-          + elbowP.distanceTo(this.bone('wrist' + SS).getWorldPosition(new THREE.Vector3()));
-        /* на ремне рука свободнее: цевьё у пряжки, локоть почти прямой */
-        const comfort = armLen * U.lerp(0.95, 0.86, this.readyAmount === undefined ? 1 : this.readyAmount);
-        const gunQ = W.getWorldQuaternion(new THREE.Quaternion());
-        /* ось цевья в мире: от дула к прикладу это +Z системы оружия */
-        const back = new THREE.Vector3(0, 0, 1).applyQuaternion(gunQ);
-        /* Ход кисти зависит от того, целится ли боец.
-
-           В ПРИЦЕЛЕ ход короткий: цевьё под стволом, и кисть, уехавшая
-           назад, закрывает мушку — ради этого весь ограничитель и вводился.
-           ОТ БЕДРА и в положении «на ремне» прицельная линия не используется,
-           зато оружие висит дальше от плеча, и без запаса хода опорная рука
-           вытягивается в струну (165–173°). Поэтому здесь ход длиннее. */
-        const aim = U.clamp01(this.adsAmount || 0);
-        const MAX_SLIDE = U.lerp(0.20, 0.085, aim);
-        let slide = 0;
-        while (slide < MAX_SLIDE && shoulder.distanceTo(target) > comfort) {
-          target.addScaledVector(back, 0.015);
-          slide += 0.015;
-        }
-      }
-      /* фактическая точка хвата — её и проверяет gripCheck */
-      this.gripTarget = this.gripTarget || {};
-      this.gripTarget[SS] = target.clone();
-
-      /* Полюс локтя — точка, КУДА смотрит локоть.
-
-         Смещение задаётся В СИСТЕМЕ ГРУДИ и поворачивается вместе с ней.
-         Раньше здесь складывались мировые координаты, поэтому при развороте
-         бойца полюс оставался висеть в мире: локти «отклеивались» от тела и
-         торчали в стороны тем сильнее, чем дальше боец повернулся от нуля.
-
-         Анатомия стрелковой стойки:
-           рабочая (правая) рука — локоть опущен вниз и чуть отведён наружу,
-           примерно под 45° от рёбер: так он держит вес оружия на костях,
-           а не на дельте;
-           опорная (левая) — локоть уходит ВНИЗ под цевьё, почти под ствол,
-           это основная опора оружия. */
-      const chestB = this.bone('chest');
-      const chest = chestB.getWorldPosition(new THREE.Vector3());
-      const chestQ = chestB.getWorldQuaternion(new THREE.Quaternion());
-      /* На ремне локти разведены наружу-назад: правая кисть лежит на
-         рукоятке у груди, и плечо отведено от рёбер на 25–35°, а не
-         прижато к боку. В стойке опорный локоть уходит под цевьё. */
-      const kr = this.readyAmount === undefined ? 1 : this.readyAmount;
-      const poleLocal = (side > 0
-        ? new THREE.Vector3(0.70, -0.40, 0.30).lerp(new THREE.Vector3(0.42, -0.58, 0.22), kr)
-        : new THREE.Vector3(-0.66, -0.36, 0.34).lerp(new THREE.Vector3(-0.12, -0.70, -0.10), kr));
-      const pole = chest.clone().add(poleLocal.applyQuaternion(chestQ));
-
-      /* Плечевой пояс работает вместе с рукой: когда кисть уходит вперёд,
-         ключица выводит плечо вперёд (протракция до ~15°), вверх или вниз —
-         поднимает или опускает его. Без этого рука вращается в «шарнире
-         куклы», а дельта остаётся прилипшей к корпусу. */
+      /* Плечевой пояс работает вместе с рукой: кисть впереди — ключица
+         выводит плечо вперёд, кисть высоко — поднимает его. Без этого рука
+         вращается в «шарнире куклы», а дельта остаётся прилипшей к корпусу. */
       {
-        const clav = this.bone('clav' + SS);
         const cp = clav.getWorldPosition(new THREE.Vector3());
-        const d = target.clone().sub(cp).applyQuaternion(chestQ.clone().invert()).normalize();
-        const prot = U.clamp(Math.max(0, -d.z) * 0.30, 0, 0.26);
-        const elev = U.clamp(d.y * 0.10 + 0.02, -0.06, 0.12);
+        const d = target.clone().sub(cp).applyQuaternion(chestQi).normalize();
+        const prot = U.clamp(Math.max(0, -d.z) * pose.clav[0], 0, 0.26);
+        const elev = U.clamp(d.y * pose.clav[1] + 0.02, -0.08, 0.12);
         clav.rotation.y += side * prot;
         clav.rotation.z += side * elev;
         clav.updateMatrixWorld(true);
       }
+      const S = shoulder.getWorldPosition(new THREE.Vector3());
 
-      twoBoneIK(THREE, {
-        root: this.bone('shoulder' + SS),
-        mid: this.bone('elbow' + SS),
-        tip: this.bone('wrist' + SS),
-        target, pole,
-        axis: new THREE.Vector3(side, 0, 0)
-      });
+      /* Опорная кисть — не гвоздь на цевье: если до точки не дотянуться
+         с согнутым локтем, кисть скользит назад, к магазину. В прицеле ход
+         короткий (0,085 м — дальше кисть закрыла бы мушку), на ремне и от
+         бедра длиннее. */
+      if (side < 0) {
+        const comfort = (lenA + lenB) * pose.reach;
+        const back = new THREE.Vector3(0, 0, 1).applyQuaternion(wq);
+        const MAX_SLIDE = U.lerp(0.20, 0.085, ka);
+        let slide = 0;
+        while (slide < MAX_SLIDE && S.distanceTo(target) > comfort) {
+          target.addScaledVector(back, 0.01);
+          slide += 0.01;
+        }
+      }
+      /* фактическая точка хвата — её и проверяет gripCheck */
+      this.gripTarget[SS] = target.clone();
 
-      /* ориентация кисти: пальцы вдоль fingerDir оружия */
-      const wq = W.getWorldQuaternion(new THREE.Quaternion());
-      const fDir = new THREE.Vector3(G.fingerDir[0] * side, G.fingerDir[1], G.fingerDir[2])
-        .normalize().applyQuaternion(wq);
-      const pDir = new THREE.Vector3(G.palmDir[0] * side, G.palmDir[1], G.palmDir[2])
-        .normalize().applyQuaternion(wq);
+      /* --- двухзвенная IK с явной осью локтевого шарнира ---
+         Кости ставятся базисом, а не «кратчайшим поворотом» от прошлого
+         кадра: иначе скрутка плеча и предплечья копилась от кадра к кадру,
+         локоть гнулся не в своей плоскости и рукав перекручивался.
+         Локальный X кости — вдоль неё (у левой руки — к плечу), Y — ось
+         сгиба локтя (в T-позе вертикаль). */
+      const toT = target.clone().sub(S);
+      const d = U.clamp(toT.length(), Math.abs(lenA - lenB) + 1e-3, (lenA + lenB) * 0.999);
+      const dir = toT.normalize();
+      const L = pose[SS];
+      const hint = new THREE.Vector3(L[0] * side, L[1], L[2]).applyQuaternion(chestQ);
+      const pdir = hint.addScaledVector(dir, -hint.dot(dir));
+      if (pdir.lengthSq() < 1e-8) pdir.set(0, -1, 0).applyQuaternion(chestQ).addScaledVector(dir, -dir.y);
+      pdir.normalize();
+      const cosA = U.clamp((lenA * lenA + d * d - lenB * lenB) / (2 * lenA * d), -1, 1);
+      const sinA = Math.sqrt(1 - cosA * cosA);
+      const E = S.clone().addScaledVector(dir, cosA * lenA).addScaledVector(pdir, sinA * lenA);
+      const Wp = S.clone().addScaledVector(dir, d);
+      const up = E.clone().sub(S).normalize();
+      const fo = Wp.clone().sub(E).normalize();
+      const hinge = new THREE.Vector3().crossVectors(pdir, dir).normalize().multiplyScalar(side);
+      setWorldBasis(THREE, shoulder, up.clone().multiplyScalar(side), hinge);
+      setWorldBasis(THREE, elbow, fo.clone().multiplyScalar(side), hinge);
 
-      const wrist = this.bone('wrist' + SS);
-      wrist.updateMatrixWorld(true);
-      const pq = wrist.parent.getWorldQuaternion(new THREE.Quaternion());
-      /* строим целевой базис: X — вдоль пальцев, Y — от ладони */
-      const ex = fDir.clone().normalize();
-      let ey = pDir.clone();
+      /* ориентация кисти: пальцы вдоль fingerDir оружия, Y — от ладони */
+      const ex = new THREE.Vector3(G.fingerDir[0] * side, G.fingerDir[1], G.fingerDir[2]).normalize().applyQuaternion(wq);
+      const ey = new THREE.Vector3(G.palmDir[0] * side, G.palmDir[1], G.palmDir[2]).normalize().applyQuaternion(wq);
       ey.addScaledVector(ex, -ey.dot(ex));
       if (ey.lengthSq() < 1e-8) ey.set(0, 1, 0);
       ey.normalize();
       const ez = new THREE.Vector3().crossVectors(ex, ey);
-      const m = new THREE.Matrix4().makeBasis(ex.multiplyScalar(side), ey, ez.multiplyScalar(side));
-      const want = new THREE.Quaternion().setFromRotationMatrix(m);
-      wrist.quaternion.copy(pq.invert().multiply(want));
+      const want = new THREE.Quaternion().setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(ex.multiplyScalar(side), ey, ez.multiplyScalar(side)));
+      wrist.quaternion.copy(elbow.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(want));
       wrist.updateMatrixWorld(true);
+
+      /* Скрутка распределяется, как у лучевой и локтевой костей: пронация
+         кисти переходит в предплечье по всей его длине (кость foreTwist,
+         веса растут от локтя к запястью), а у дельты плечо остаётся без
+         скрутки (armTwist её гасит) — рукав не перекручивается «фантиком». */
+      const ft = this.bone('foreTwist' + SS), at = this.bone('armTwist' + SS);
+      const X = new THREE.Vector3(1, 0, 0);
+      if (ft) {
+        const tw = U.clamp(twistX(wrist.quaternion), -1.75, 1.75);
+        ft.quaternion.setFromAxisAngle(X, tw);
+        ft.updateMatrixWorld(true);
+      }
+      if (at) {
+        at.quaternion.setFromAxisAngle(X, -twistX(shoulder.quaternion));
+        at.updateMatrixWorld(true);
+      }
+      this.armDebug[SS] = { elbow: E, wrist: Wp, hint: pdir };
 
       /* пальцы обхватывают */
       const trig = side > 0 ? this.triggerCurl : undefined;
       this.thumbAmount = G.thumb;
-      curlFingers(this, side, side > 0 ? 1.02 : 0.90, trig);
+      this.thumbBase = G.thumbBase || [0.55, 0.30];
+      curlFingers(this, side, G.curl, trig);
     }
   };
 
@@ -10325,7 +10550,7 @@ function buildAK74(THREE, opts) {
     return out;
   };
 
-  return { Rig, twoBoneIK, alignBone, curlFingers, applyBasePose, GRIP };
+  return { Rig, twoBoneIK, alignBone, curlFingers, applyBasePose, GRIP, ARM };
 });
 /* ==========================================================================
    МОДУЛЬ: world.js
@@ -14166,14 +14391,6 @@ function buildAK74(THREE, opts) {
       pos: new THREE.Vector3(0.145, -0.375, -0.090),
       rot: new THREE.Euler(0.30, -0.42, 0.24)
     };
-    /* Строй: оружие на ремне у груди стволом вниз — поза с референса.
-       Знак X важен: поворот +X вокруг оси экрана уводит ствол (-Z) ВВЕРХ,
-       поэтому «стволом вниз» — это отрицательный угол. */
-    const IDLE_POSE = {
-      pos: new THREE.Vector3(0.090, -0.360, -0.075),
-      rot: new THREE.Euler(-0.60, -0.16, 0.13)
-    };
-
     /* Строй «на ремне» задаётся не от глаз, а от ГРУДИ — как на референсе:
        автомат лежит поперёк корпуса по диагонали, приклад у правой грудной,
        ствол смотрит к левому колену, правый бок оружия — наружу.
@@ -14182,8 +14399,8 @@ function buildAK74(THREE, opts) {
        так, чтобы его точки хвата легли ровно в них, поэтому поза не зависит
        от цевья и длины оружия. out — куда смотрит правый бок оружия. */
     const SLING = {
-      right: new THREE.Vector3(0.070, 1.262, -0.222),
-      barrel: new THREE.Vector3(-0.60, -0.78, -0.17),
+      right: new THREE.Vector3(0.050, 1.235, -0.225),
+      barrel: new THREE.Vector3(-0.64, -0.74, -0.17),
       out: new THREE.Vector3(0.20, 0.10, -1)
     };
     const _sl = {
@@ -14992,7 +15209,31 @@ function buildAK74(THREE, opts) {
         out.gunPitch = Math.round(Math.asin(U.clamp(-bd.y, -1, 1)) * 180 / Math.PI);
         out.key = s.key;
         return out;
-      })
+      }),
+      /* Прицел: опорная кисть не должна подниматься к прицельной линии
+         (0,116 м в системе оружия, верх цевья — 0,112). top — наивысшая
+         точка левой перчатки у цевья в системе оружия, clearance — запас
+         до линии. Вершины считаются линейным скиннингом на CPU: он
+         расходится с шейдерным на миллиметры, запас это покрывает. */
+      sightCheck: (i) => {
+        const s = squad[i === undefined ? Math.max(0, S.activeIdx) : i];
+        const mesh = s.char.meshes.glove;
+        if (!mesh) return null;
+        const g = s.gun.gun;
+        g.updateMatrixWorld(true);
+        s.char.root.updateMatrixWorld(true);
+        const inv = new THREE.Matrix4().copy(g.matrixWorld).invert();
+        const pos = mesh.geometry.attributes.position, v = new THREE.Vector3();
+        let top = -Infinity;
+        for (let k = 0; k < pos.count; k++) {
+          if (pos.getX(k) > 0) continue;                 // левая перчатка: в позе покоя x < 0
+          v.fromBufferAttribute(pos, k);
+          mesh.applyBoneTransform(k, v);
+          v.applyMatrix4(mesh.matrixWorld).applyMatrix4(inv);
+          if (v.z < -0.2) top = Math.max(top, v.y);      // только у цевья
+        }
+        return { key: s.key, ads: +s.ctrl.ads.toFixed(2), top: +top.toFixed(4), clearance: +(0.116 - top).toFixed(4) };
+      }
     };
 
     /* Ручная постановка камеры для съёмки и визуальных проверок:

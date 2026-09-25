@@ -1,65 +1,90 @@
+/* Визуальная и геометрическая проверка бойцов.
+
+   node tools/render-check.mjs [папка для кадров]
+
+   Поднимает start.html в headless Chromium (SwiftShader), снимает бойцов
+   спереди в кадре как у референса, в 3/4 и в профиль, затем берёт бойца
+   под управление и снимает прицел. Печатает gripCheck/sightCheck и
+   завершается с кодом 1, если руки прижаты к корпусу, кисти не на
+   оружии или пальцы поднимаются к прицельной линии. */
 import { chromium } from 'playwright';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-const root = process.env.ROOT || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const OUT = process.env.OUT || path.join(root, 'shots');
+
+const ROOT = process.env.ROOT || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const OUT = path.resolve(process.argv[2] || process.env.OUT || path.join(ROOT, 'shots'));
 fs.mkdirSync(OUT, { recursive: true });
-const types = { '.html': 'text/html', '.json': 'application/json', '.jpg': 'image/jpeg', '.png': 'image/png', '.bin': 'application/octet-stream', '.hdr': 'application/octet-stream' };
+
 const srv = http.createServer((q, r) => {
-  const p = path.join(root, decodeURIComponent(q.url.split('?')[0]));
-  fs.readFile(p, (e, d) => { if (e) { r.writeHead(404); r.end(); return; } r.writeHead(200, { 'Content-Type': types[path.extname(p)] || 'application/octet-stream' }); r.end(d); });
+  const p = path.join(ROOT, decodeURIComponent(q.url.split('?')[0]));
+  fs.readFile(p, (e, d) => { if (e) { r.writeHead(404); r.end(); return; } r.writeHead(200); r.end(d); });
 }).listen(0);
-const port = srv.address().port;
-const tag = process.argv[2] || 'x';
-const which = (process.argv[3] || 'front').split(',');
+
+/* SwiftShader в одном процессе: иначе headless не создаёт WebGL2 */
 const browser = await chromium.launch({ args: ['--enable-unsafe-swiftshader', '--in-process-gpu', '--disable-gpu-sandbox', '--ignore-gpu-blocklist'] });
 const page = await browser.newPage({ viewport: { width: 1100, height: 760 } });
-const logs = [];
-page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') logs.push(m.type() + ': ' + m.text()); });
-page.on('pageerror', (e) => logs.push('pageerror: ' + e.message));
-await page.goto(`http://localhost:${port}/start.html`);
-await page.waitForFunction(() => window.__GAME && window.__GAME.squad, null, { timeout: 240000 });
-await page.evaluate(() => { const s = document.getElementById('start'); if (s) s.style.display = 'none'; });
+const errors = [];
+page.on('pageerror', (e) => errors.push(e.message));
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+await page.goto(`http://localhost:${srv.address().port}/start.html`);
+await page.waitForFunction(() => (window.__GAME && window.__GAME.squad) || document.getElementById('err').textContent, null, { timeout: 400000 });
 const err = await page.evaluate(() => document.getElementById('err').textContent);
-if (err) console.log('ERR', err.slice(0, 800));
-const X = [-4.2, -1.75, 1.75, 4.2];
-const views = {
-  front: X.map((x, i) => ({ n: 'f' + i, from: [x, 1.30, 1.2 + 2.3], to: [x, 1.12, 1.2], fov: 40 })),
-  close: X.map((x, i) => ({ n: 'c' + i, from: [x, 1.35, 1.2 + 1.35], to: [x, 1.25, 1.2], fov: 40 })),
-  side: [0, 2].map((i) => ({ n: 's' + i, from: [X[i] + 2.2, 1.35, 1.2 + 0.6], to: [X[i], 1.2, 1.2], fov: 40 })),
-  q34: [1, 3].map((i) => ({ n: 'q' + i, from: [X[i] - 1.5, 1.4, 1.2 + 1.9], to: [X[i], 1.2, 1.2], fov: 40 })),
-  group: [{ n: 'g', from: [0, 1.4, 10.5], to: [0, 1.0, 1.2], fov: 50 }],
-  top: [0, 2].map((i) => ({ n: 't' + i, from: [X[i], 3.2, 1.2 + 0.5], to: [X[i], 1.1, 1.2], fov: 45 }))
-};
-await page.evaluate(() => { window.requestAnimationFrame = () => 0; });
-await page.waitForTimeout(500);
-for (const w of which) for (const v of (views[w] || [])) {
-  const url = await page.evaluate((v) => {
-    const G = window.__GAME;
-    G.view(v.from, v.to, v.fov);
-    G.step(40, 1 / 60);
-    G.view(v.from, v.to, v.fov);
-    G.step(1, 1 / 60);
+if (err) { console.error(err); process.exit(1); }
+
+/* Кадры рисуем сами: непрерывный цикл requestAnimationFrame в SwiftShader
+   не даёт странице простаивать, и штатный скриншот не дожидается кадра. */
+await page.evaluate(() => {
+  document.getElementById('start').style.display = 'none';
+  window.requestAnimationFrame = () => 0;
+  const G = window.__GAME;
+  window.__shot = (from, to, fov, w, h, steps) => {
+    if (from) G.view(from, to, fov);
+    G.step(steps, 1 / 60);
+    if (from) { G.view(from, to, fov); G.step(1, 1 / 60); }
+    G.renderer.setSize(w, h, false);
+    G.camera.aspect = w / h; G.camera.updateProjectionMatrix();
     G.renderer.render(G.scene, G.camera);
     return G.renderer.domElement.toDataURL('image/png');
-  }, v);
-  fs.writeFileSync(`${OUT}/${tag}_${v.n}.png`, Buffer.from(url.split(',')[1], 'base64'));
+  };
+});
+const save = (name, url) => fs.writeFileSync(path.join(OUT, name + '.png'), Buffer.from(url.split(',')[1], 'base64'));
+const X = [-4.2, -1.75, 1.75, 4.2], Z = 1.2;
+
+/* 1. строй «на ремне» */
+const views = [];
+X.forEach((x, i) => views.push([`front${i}`, [x, 1.25, Z + 6.0], [x, 1.19, Z], 13.2, 330, 700]));
+views.push(['q34_left', [X[0] - 2.6, 1.4, Z + 2.6], [X[0], 1.2, Z], 22, 420, 640]);
+views.push(['q34_right', [X[3] + 2.6, 1.4, Z + 2.6], [X[3], 1.2, Z], 22, 420, 640]);
+views.push(['side_left', [X[0] - 3.8, 1.3, Z], [X[0], 1.2, Z], 22, 420, 640]);
+views.push(['side_right', [X[3] + 3.8, 1.3, Z], [X[3], 1.2, Z], 22, 420, 640]);
+views.push(['squad', [0, 1.4, 10.5], [0, 1.0, Z], 45, 1100, 620]);
+let first = true;
+for (const [name, from, to, fov, w, h] of views) {
+  save(name, await page.evaluate((a) => window.__shot(...a), [from, to, fov, w, h, first ? 40 : 3]));
+  first = false;
 }
-if (which.includes('emb')) {
-  const url = await page.evaluate(() => {
-    const G = window.__GAME; const T = window.THREE;
-    G.embody(1); G.step(90, 1 / 60);
-    const s = G.squad[1], p = s.ctrl.pos;
-    const put = (off) => { G.camera.position.set(p.x + off[0], p.y + off[1], p.z + off[2]); G.camera.lookAt(p.x, p.y + 1.25, p.z); G.camera.fov = 40; G.camera.updateProjectionMatrix(); G.camera.updateMatrixWorld(); };
-    const out = [];
-    for (const off of [[0.6, 1.4, 2.2], [-2.0, 1.4, 0.4]]) { put(off); G.renderer.render(G.scene, G.camera); out.push(G.renderer.domElement.toDataURL('image/png')); }
-    return out;
-  });
-  url.forEach((u, i) => fs.writeFileSync(`${OUT}/${tag}_e${i}.png`, Buffer.from(u.split(',')[1], 'base64')));
+const grip = await page.evaluate(() => window.__GAME.gripCheck());
+
+/* 2. прицел: боец под управлением, ПКМ зажата */
+await page.evaluate(() => { const G = window.__GAME; G.embody(1); G.setInput({ lock: true, ads: true }); });
+save('ads', await page.evaluate(() => window.__shot(null, null, 0, 1185, 662, 90)));
+const sight = await page.evaluate(() => window.__GAME.sightCheck());
+await page.evaluate(() => window.__GAME.setInput({ ads: false }));
+save('hip', await page.evaluate(() => window.__shot(null, null, 0, 1185, 662, 60)));
+
+/* 3. проверки */
+const fails = [];
+for (const g of grip) {
+  console.log(JSON.stringify(g));
+  if (g.palmR > 0.04 || g.palmL > 0.04) fails.push(`${g.key}: кисть не на оружии (${g.palmR}/${g.palmL})`);
+  if (g.key === 'delta_2') continue;                       // этот боец под управлением, у него стойка
+  if (g.abductR < 8 || g.abductL < 8) fails.push(`${g.key}: плечо прижато к корпусу (${g.abductR}°/${g.abductL}°)`);
+  if (g.elbowOutR < 0.25 || g.elbowOutL < 0.25) fails.push(`${g.key}: локоть внутри контура жилета (${g.elbowOutR}/${g.elbowOutL} м)`);
 }
-const gc = await page.evaluate(() => window.__GAME.gripCheck());
-console.log(JSON.stringify(gc));
-if (process.env.EVAL) console.log(JSON.stringify(await page.evaluate(process.env.EVAL)));
-console.log(logs.slice(0, 15).join('\n'));
+console.log('sight', JSON.stringify(sight));
+if (!sight || sight.ads < 0.95 || sight.clearance < 0.01) fails.push(`прицел: пальцы у прицельной линии (${JSON.stringify(sight)})`);
+if (errors.length) fails.push('ошибки страницы: ' + errors.slice(0, 3).join(' | '));
+console.log(fails.length ? 'FAIL\n  ' + fails.join('\n  ') : 'PASS', '\nкадры:', OUT);
 await browser.close(); srv.close();
+process.exit(fails.length ? 1 : 0);
